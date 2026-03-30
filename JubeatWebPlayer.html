@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jubeat 谱面模拟播放器 (双规引擎版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #111827; color: white; font-family: sans-serif; }
+        canvas { box-shadow: 0 0 20px rgba(0,0,0,0.5); border-radius: 12px; }
+        input[type="range"] { accent-color: #3b82f6; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center py-10 px-4">
+
+    <h1 class="text-3xl font-bold mb-8 tracking-wider text-blue-400">JUBEAT WEB PLAYER</h1>
+
+    <div class="flex flex-col md:flex-row gap-8 w-full max-w-5xl">
+        
+        <div class="bg-gray-800 p-6 rounded-xl flex-1 border border-gray-700 shadow-xl">
+            <h2 class="text-xl font-semibold mb-4 border-b border-gray-600 pb-2">📂 文件加载</h2>
+            
+            <div class="mb-4">
+                <label class="block text-sm text-gray-400 mb-1">1. 选择音乐文件 (MP3/OGG/WAV)</label>
+                <input type="file" id="audioUpload" accept="audio/*" class="w-full text-sm text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer">
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm text-gray-400 mb-1">2. 选择谱面文件 (.mid / .bytes)</label>
+                <input type="file" id="midiUpload" accept=".mid,.bytes" class="w-full text-sm text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-purple-600 file:text-white hover:file:bg-purple-700 cursor-pointer">
+            </div>
+
+            <div class="mb-6">
+                <label class="block text-sm text-gray-400 mb-1">3. 选择难度轨道</label>
+                <select id="trackSelect" class="w-full bg-gray-700 text-white rounded p-2 outline-none border border-gray-600 disabled:opacity-50" disabled>
+                    <option value="">请先上传 MIDI...</option>
+                </select>
+            </div>
+
+            <h2 class="text-xl font-semibold mb-4 border-b border-gray-600 pb-2 mt-8">⚙️ 播放控制</h2>
+            
+            <div class="flex items-center gap-4 mb-6">
+                <button id="playBtn" class="bg-green-600 hover:bg-green-500 text-white px-8 py-3 rounded-lg font-bold text-lg transition-colors shadow-lg disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    ▶ 播 放
+                </button>
+                <span id="timeDisplay" class="font-mono text-xl text-gray-300">00:00 / 00:00</span>
+            </div>
+
+            <div class="mb-6">
+                <input type="range" id="progressBar" min="0" max="100" value="0" step="0.1" class="w-full disabled:opacity-50" disabled>
+            </div>
+
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 flex justify-between">
+                        <span>音频偏移 (Offset ms)</span>
+                        <span id="offsetVal" class="text-blue-400">0 ms</span>
+                    </label>
+                    <input type="range" id="offsetSlider" min="-500" max="500" value="0" step="10" class="w-full">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 flex justify-between">
+                        <span>音符流速 (Approach Time)</span>
+                        <span id="speedVal" class="text-blue-400">1.0 s</span>
+                    </label>
+                    <input type="range" id="speedSlider" min="0.3" max="2.0" value="1.0" step="0.1" class="w-full">
+                </div>
+            </div>
+        </div>
+
+        <div class="flex justify-center items-center flex-1">
+            <div class="relative">
+                <canvas id="gameCanvas" width="500" height="500" class="bg-gray-800 border-4 border-gray-700"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 底层 MIDI 协议解析器 ---
+        function parseMIDI(buffer) {
+            const view = new DataView(buffer);
+            let offset = 0;
+
+            function readString(len) {
+                let s = '';
+                for(let i = 0; i < len; i++) s += String.fromCharCode(view.getUint8(offset++));
+                return s;
+            }
+            function readU32() { let v = view.getUint32(offset); offset += 4; return v; }
+            function readU16() { let v = view.getUint16(offset); offset += 2; return v; }
+            function readU8() { let v = view.getUint8(offset); offset += 1; return v; }
+            function readVarInt() {
+                let v = 0;
+                while(true) {
+                    let b = readU8();
+                    v = (v << 7) | (b & 0x7F);
+                    if((b & 0x80) === 0) break;
+                }
+                return v;
+            }
+
+            if(readString(4) !== 'MThd') throw new Error("缺少 MIDI 头部 (MThd)");
+            readU32(); 
+            let format = readU16();
+            let numTracks = readU16();
+            let tpqn = readU16();
+
+            let tracks = [];
+            for(let i = 0; i < numTracks; i++) {
+                if(readString(4) !== 'MTrk') throw new Error("轨道格式损坏 (MTrk)");
+                let trkLen = readU32();
+                let trkEnd = offset + trkLen;
+                let events = [];
+                let runningStatus = 0;
+                let absTime = 0;
+
+                while(offset < trkEnd) {
+                    let dt = readVarInt();
+                    absTime += dt;
+                    let status = readU8();
+                    
+                    if(status < 0x80) {
+                        status = runningStatus;
+                        offset--; 
+                    } else {
+                        if (status < 0xF0) runningStatus = status;
+                    }
+
+                    let type = status >> 4;
+                    
+                    if(type === 0x8) {
+                        events.push({absTime, type: 'note_off', note: readU8(), vel: readU8()});
+                    } else if(type === 0x9) {
+                        let note = readU8();
+                        let vel = readU8();
+                        events.push({absTime, type: vel === 0 ? 'note_off' : 'note_on', note, vel});
+                    } else if(type === 0xA || type === 0xB || type === 0xE) {
+                        readU8(); readU8(); 
+                    } else if(type === 0xC || type === 0xD) {
+                        readU8(); 
+                    } else if(status === 0xFF) { 
+                        let metaType = readU8();
+                        let len = readVarInt();
+                        if(metaType === 0x51) { 
+                            let tempo = (readU8() << 16) | (readU8() << 8) | readU8();
+                            events.push({absTime, type: 'tempo', tempo});
+                        } else if(metaType === 0x03) { 
+                            let name = readString(len);
+                            name = name.replace(/\x00/g, '').trim(); 
+                            events.push({absTime, type: 'track_name', name});
+                        } else {
+                            offset += len; 
+                        }
+                    } else if(status === 0xF0 || status === 0xF7) { 
+                        let len = readVarInt();
+                        offset += len;
+                    }
+                }
+                tracks.push(events);
+            }
+            return {tpqn, tracks};
+        }
+
+        // --- 物理时间转换 ---
+        function getEveTime(ticks, tempoMap, tpqn) {
+            let totalSec = 0;
+            let lastTick = 0;
+            let activeTempo = 500000;
+            if (tempoMap.length > 0 && tempoMap[0].ticks === 0) activeTempo = tempoMap[0].tempo;
+
+            for (let i = 0; i < tempoMap.length; i++) {
+                let t = tempoMap[i].ticks;
+                let tempo = tempoMap[i].tempo;
+                if (t === 0) continue;
+                if (ticks >= t) {
+                    let trueBpm = Math.round(60000000 / activeTempo);
+                    totalSec += ((t - lastTick) / tpqn) * (60 / trueBpm);
+                    lastTick = t;
+                    activeTempo = tempo;
+                } else {
+                    break;
+                }
+            }
+            let trueBpm = Math.round(60000000 / activeTempo);
+            totalSec += ((ticks - lastTick) / tpqn) * (60 / trueBpm);
+            return totalSec;
+        }
+
+        // --- DOM 及状态 ---
+        let audioElement = new Audio();
+        let parsedTracksData = [];
+        let currentNotes = [];
+        let isPlaying = false;
+        let animationId = null;
+        let offsetSec = 0; 
+        let approachTime = 1.0; 
+
+        const audioUpload = document.getElementById('audioUpload');
+        const midiUpload = document.getElementById('midiUpload');
+        const trackSelect = document.getElementById('trackSelect');
+        const playBtn = document.getElementById('playBtn');
+        const progressBar = document.getElementById('progressBar');
+        const timeDisplay = document.getElementById('timeDisplay');
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        const offsetSlider = document.getElementById('offsetSlider');
+        const offsetVal = document.getElementById('offsetVal');
+        const speedSlider = document.getElementById('speedSlider');
+        const speedVal = document.getElementById('speedVal');
+
+        const PANEL_SIZE = canvas.width / 4;
+        const PADDING = 10;
+
+        function drawGrid() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            for (let i = 0; i < 16; i++) {
+                const col = i % 4, row = Math.floor(i / 4);
+                const x = col * PANEL_SIZE, y = row * PANEL_SIZE;
+                ctx.fillStyle = '#1f2937'; 
+                ctx.fillRect(x + PADDING, y + PADDING, PANEL_SIZE - PADDING*2, PANEL_SIZE - PADDING*2);
+                ctx.strokeStyle = '#374151';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(x + PADDING, y + PADDING, PANEL_SIZE - PADDING*2, PANEL_SIZE - PADDING*2);
+            }
+        }
+        drawGrid();
+
+        function formatTime(sec) {
+            const m = Math.floor(sec / 60).toString().padStart(2, '0');
+            const s = Math.floor(sec % 60).toString().padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
+        audioUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            audioElement.src = URL.createObjectURL(file);
+            audioElement.onloadedmetadata = () => {
+                timeDisplay.innerText = `00:00 / ${formatTime(audioElement.duration)}`;
+                progressBar.disabled = false;
+                checkReady();
+            };
+        });
+
+        // --- 核心 MIDI 解析与提取 (加入新老长押规则探测) ---
+        midiUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            
+            reader.onload = function(e) {
+                try {
+                    const midi = parseMIDI(e.target.result);
+                    const tpqn = midi.tpqn;
+                    let tempoMap = [];
+                    
+                    midi.tracks.forEach(trk => {
+                        trk.forEach(ev => {
+                            if (ev.type === 'tempo') tempoMap.push({ ticks: ev.absTime, tempo: ev.tempo });
+                        });
+                    });
+                    tempoMap.sort((a, b) => a.ticks - b.ticks);
+                    if (tempoMap.length === 0) tempoMap.push({ ticks: 0, tempo: 500000 });
+
+                    parsedTracksData = [];
+                    trackSelect.innerHTML = '';
+                    let validTrackCount = 0;
+
+                    midi.tracks.forEach((trk, idx) => {
+                        let trackName = `Track ${idx}`;
+                        let curNotes = [];
+                        let pendingLongs = {};
+                        
+                        // 🌟 AI 预扫描：判断是否是 100 力度的新规谱面
+                        let isV100Mode = false;
+                        for (let ev of trk) {
+                            if (ev.type === 'note_on' && ev.vel === 100) {
+                                isV100Mode = true;
+                                break;
+                            }
+                        }
+
+                        trk.forEach(ev => {
+                            if (ev.type === 'track_name') {
+                                if (ev.name) trackName = ev.name;
+                            } else if (ev.type === 'note_on' && ev.note >= 36 && ev.note <= 51) {
+                                // 瞬间音符
+                                if (ev.vel > 16) {
+                                    curNotes.push({
+                                        panel: ev.note - 36,
+                                        time: getEveTime(ev.absTime, tempoMap, tpqn),
+                                        duration: 0,
+                                        isLong: false
+                                    });
+                                } 
+                                // 长押起手式
+                                else if (ev.vel >= 1 && ev.vel <= 16) {
+                                    if (isV100Mode) {
+                                        // 100 新规模式：箭头来源未知，等待 note_off
+                                        pendingLongs[ev.note] = { absTime: ev.absTime, arrowPanel: null };
+                                    } else {
+                                        // 127 经典模式：起手式就带了箭头来源
+                                        pendingLongs[ev.note] = { absTime: ev.absTime, arrowPanel: ev.vel - 1 };
+                                    }
+                                }
+                            } else if (ev.type === 'note_off' && ev.note >= 36 && ev.note <= 51) {
+                                if (pendingLongs[ev.note] !== undefined) {
+                                    let onsetTime = getEveTime(pendingLongs[ev.note].absTime, tempoMap, tpqn);
+                                    let offsetTime = getEveTime(ev.absTime, tempoMap, tpqn);
+                                    
+                                    // 🌟 动态决定箭头来源
+                                    let arrowPanel = pendingLongs[ev.note].arrowPanel;
+                                    if (isV100Mode) {
+                                        // 提取 note_off 的释放力度
+                                        let releaseVel = ev.vel;
+                                        if (releaseVel >= 1 && releaseVel <= 16) {
+                                            arrowPanel = releaseVel - 1;
+                                        } else {
+                                            arrowPanel = ev.note - 36; // 兜底：原地长按
+                                        }
+                                    }
+
+                                    curNotes.push({
+                                        panel: ev.note - 36, // 目标面板
+                                        arrowPanel: arrowPanel, // 箭头来源面板
+                                        time: onsetTime,
+                                        duration: offsetTime - onsetTime,
+                                        isLong: true
+                                    });
+                                    delete pendingLongs[ev.note];
+                                }
+                            }
+                        });
+
+                        if (curNotes.length > 0) {
+                            curNotes.sort((a,b) => a.time - b.time); 
+                            parsedTracksData.push({ id: idx, name: trackName, notes: curNotes });
+                            
+                            validTrackCount++;
+                            const option = document.createElement('option');
+                            option.value = parsedTracksData.length - 1; 
+                            option.text = `${trackName.toUpperCase()} (音符数: ${curNotes.length}) ${isV100Mode ? '[v100规]' : ''}`;
+                            trackSelect.appendChild(option);
+                        }
+                    });
+                    
+                    if (validTrackCount > 0) {
+                        trackSelect.disabled = false;
+                        loadTrackNotes(); 
+                        checkReady();
+                    }
+                } catch (err) {
+                    alert("MIDI 解析失败: " + err.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        trackSelect.addEventListener('change', loadTrackNotes);
+
+        function loadTrackNotes() {
+            if (parsedTracksData.length === 0 || trackSelect.value === "") return;
+            const dataIdx = parseInt(trackSelect.value);
+            currentNotes = parsedTracksData[dataIdx].notes;
+            if (!isPlaying) drawGrid();
+            checkReady();
+        }
+
+        function checkReady() {
+            if (audioElement.src && currentNotes.length > 0) playBtn.disabled = false;
+        }
+
+        playBtn.addEventListener('click', () => {
+            if (isPlaying) {
+                audioElement.pause();
+                playBtn.innerHTML = "▶ 播 放";
+                playBtn.classList.replace('bg-yellow-600', 'bg-green-600');
+            } else {
+                audioElement.play();
+                playBtn.innerHTML = "⏸ 暂 停";
+                playBtn.classList.replace('bg-green-600', 'bg-yellow-600');
+                if (!animationId) gameLoop();
+            }
+            isPlaying = !isPlaying;
+        });
+
+        audioElement.addEventListener('timeupdate', () => {
+            if(!isPlaying) return; 
+            progressBar.value = (audioElement.currentTime / audioElement.duration) * 100;
+            timeDisplay.innerText = `${formatTime(audioElement.currentTime)} / ${formatTime(audioElement.duration)}`;
+        });
+
+        progressBar.addEventListener('input', (e) => {
+            const seekTime = (e.target.value / 100) * audioElement.duration;
+            audioElement.currentTime = seekTime;
+            timeDisplay.innerText = `${formatTime(seekTime)} / ${formatTime(audioElement.duration)}`;
+        });
+
+        offsetSlider.addEventListener('input', (e) => {
+            offsetSec = parseInt(e.target.value) / 1000.0;
+            offsetVal.innerText = `${e.target.value} ms`;
+        });
+        speedSlider.addEventListener('input', (e) => {
+            approachTime = parseFloat(e.target.value);
+            speedVal.innerText = `${approachTime.toFixed(1)} s`;
+        });
+
+        // --- 核心游戏渲染循环 ---
+        function gameLoop() {
+            drawGrid();
+            const currentTime = audioElement.currentTime - offsetSec;
+
+            currentNotes.forEach(note => {
+                const cx = (note.panel % 4) * PANEL_SIZE + (PANEL_SIZE / 2);
+                const cy = Math.floor(note.panel / 4) * PANEL_SIZE + (PANEL_SIZE / 2);
+                const maxDrawSize = PANEL_SIZE - PADDING*2;
+
+                if (currentTime >= note.time - approachTime && currentTime < note.time) {
+                    const progress = 1.0 - ((note.time - currentTime) / approachTime);
+                    
+                    if (note.isLong) {
+                        const size = maxDrawSize * progress;
+                        ctx.fillStyle = 'rgba(245, 158, 11, 0.2)'; 
+                        ctx.fillRect(cx - size/2, cy - size/2, size, size);
+                        ctx.strokeStyle = '#f59e0b';
+                        ctx.lineWidth = 3;
+                        ctx.strokeRect(cx - size/2, cy - size/2, size, size);
+
+                        const arrCol = note.arrowPanel % 4;
+                        const arrRow = Math.floor(note.arrowPanel / 4);
+                        const startX = arrCol * PANEL_SIZE + (PANEL_SIZE / 2); 
+                        const startY = arrRow * PANEL_SIZE + (PANEL_SIZE / 2); 
+                        
+                        const currentX = startX + (cx - startX) * progress;
+                        const currentY = startY + (cy - startY) * progress;
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(startX, startY);
+                        ctx.lineTo(cx, cy);
+                        ctx.strokeStyle = 'rgba(245, 158, 11, 0.15)';
+                        ctx.lineWidth = 12;
+                        ctx.stroke();
+
+                        const angle = Math.atan2(cy - startY, cx - startX);
+                        ctx.save();
+                        ctx.translate(currentX, currentY);
+                        ctx.rotate(angle);
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(-18, -15); 
+                        ctx.lineTo(12, 0);    
+                        ctx.lineTo(-18, 15);  
+                        ctx.lineTo(-6, 0);    
+                        ctx.closePath();
+                        
+                        ctx.fillStyle = '#fbbf24'; 
+                        ctx.shadowColor = '#f59e0b';
+                        ctx.shadowBlur = 10;
+                        ctx.fill();
+                        ctx.restore();
+
+                    } else {
+                        const size = maxDrawSize * progress;
+                        ctx.fillStyle = 'rgba(59, 130, 246, 0.3)';
+                        ctx.fillRect(cx - size/2, cy - size/2, size, size);
+                        ctx.strokeStyle = '#3b82f6';
+                        ctx.lineWidth = 3;
+                        ctx.strokeRect(cx - size/2, cy - size/2, size, size);
+                    }
+                }
+                
+                if (!note.isLong && currentTime >= note.time && currentTime <= note.time + 0.1) {
+                    ctx.fillStyle = '#60a5fa';
+                    ctx.fillRect(cx - maxDrawSize/2, cy - maxDrawSize/2, maxDrawSize, maxDrawSize);
+                    ctx.fillStyle = 'white';
+                    ctx.fillRect(cx - maxDrawSize/4, cy - maxDrawSize/4, maxDrawSize/2, maxDrawSize/2);
+                }
+
+                if (note.isLong && currentTime >= note.time && currentTime <= note.time + note.duration) {
+                    const arrCol = note.arrowPanel % 4;
+                    const arrRow = Math.floor(note.arrowPanel / 4);
+                    const startX = arrCol * PANEL_SIZE + (PANEL_SIZE / 2);
+                    const startY = arrRow * PANEL_SIZE + (PANEL_SIZE / 2);
+
+                    const pulse = Math.abs(Math.sin(currentTime * 15)); 
+
+                    ctx.beginPath();
+                    ctx.moveTo(startX, startY);
+                    ctx.lineTo(cx, cy);
+                    ctx.strokeStyle = `rgba(245, 158, 11, ${0.4 + pulse * 0.4})`;
+                    ctx.lineWidth = 16;
+                    ctx.stroke();
+
+                    ctx.strokeStyle = 'rgba(245, 158, 11, 0.5)';
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(startX - maxDrawSize/2, startY - maxDrawSize/2, maxDrawSize, maxDrawSize);
+
+                    ctx.fillStyle = '#f59e0b';
+                    ctx.fillRect(cx - maxDrawSize/2, cy - maxDrawSize/2, maxDrawSize, maxDrawSize);
+                    ctx.fillStyle = `rgba(255, 255, 255, ${0.4 + pulse * 0.4})`;
+                    ctx.fillRect(cx - maxDrawSize/3, cy - maxDrawSize/3, maxDrawSize*0.66, maxDrawSize*0.66);
+                }
+            });
+
+            if (isPlaying || !audioElement.paused) animationId = requestAnimationFrame(gameLoop);
+            else animationId = null;
+        }
+
+        audioElement.addEventListener('ended', () => {
+            isPlaying = false;
+            playBtn.innerHTML = "▶ 播 放";
+            playBtn.classList.replace('bg-yellow-600', 'bg-green-600');
+            progressBar.value = 0;
+            drawGrid();
+        });
+    </script>
+</body>
+</html>
